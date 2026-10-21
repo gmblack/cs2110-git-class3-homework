@@ -1,0 +1,130 @@
+
+name: Move Linked Issues to In Review
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  move-issues:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update linked issues
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const owner = 'mingzhisun-boop';
+            const repo = 'cs2110-git-class3-homework-sun-mingzhi';
+            const projectNumber = 1;
+            const prNumber = context.issue.number;
+
+            const projectResult = await github.graphql(`
+              query($owner: String!, $number: Int!) {
+                user(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    fields(first: 100) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { owner, number: projectNumber });
+
+            const project = projectResult.user.projectV2;
+            if (!project) throw new Error('Project not found');
+
+            const status = project.fields.nodes.find(
+              field => field?.name === 'Status'
+            );
+            const review = status?.options.find(
+              option => option.name === 'In Review'
+            );
+
+            if (!review) {
+              throw new Error('In Review status not found');
+            }
+
+            const prResult = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 100) {
+                      nodes {
+                        number
+                        state
+                        projectItems(first: 100) {
+                          nodes {
+                            id
+                            project {
+                              id
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { owner, repo, number: prNumber });
+
+            const issues = prResult.repository.pullRequest
+              .closingIssuesReferences.nodes;
+
+            core.info(`Found ${issues.length} linked issues`);
+
+            for (const issue of issues) {
+              if (issue.state !== 'OPEN') continue;
+
+              const item = issue.projectItems.nodes.find(
+                item => item.project.id === project.id
+              );
+
+              if (!item) {
+                core.warning(`Issue #${issue.number} not in Project`);
+                continue;
+              }
+
+              await github.graphql(`
+                mutation(
+                  $projectId: ID!,
+                  $itemId: ID!,
+                  $fieldId: ID!,
+                  $optionId: String!
+                ) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId,
+                    itemId: $itemId,
+                    fieldId: $fieldId,
+                    value: { singleSelectOptionId: $optionId }
+                  }) {
+                    projectV2Item {
+                      id
+                    }
+                  }
+                }
+              `, {
+                projectId: project.id,
+                itemId: item.id,
+                fieldId: status.id,
+                optionId: review.id
+              });
+
+              core.info(`Issue #${issue.number} moved to In Review`);
+            }
